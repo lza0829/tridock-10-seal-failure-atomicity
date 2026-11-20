@@ -3,6 +3,9 @@ from collections import defaultdict
 from datetime import datetime, timezone
 import sqlite3
 
+from app.services.audit import emit_audit
+from app.services.gate import is_sealed
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -14,6 +17,54 @@ def _sum_map(conn: sqlite3.Connection, table: str, dock_day: str) -> dict[tuple[
         (dock_day,),
     ).fetchall()
     return {(r["supplier_code"], r["sku"]): float(r["q"]) for r in rows}
+
+
+def _snapshot_map(conn: sqlite3.Connection, batch_id: int) -> dict[tuple[str, str], tuple[float, float, float]]:
+    rows = conn.execute(
+        "SELECT supplier_code, sku, expect_qty, receive_qty, confirm_qty FROM match_rows WHERE batch_id=?",
+        (batch_id,),
+    ).fetchall()
+    return {
+        (r["supplier_code"], r["sku"]): (float(r["expect_qty"]), float(r["receive_qty"]), float(r["confirm_qty"]))
+        for r in rows
+    }
+
+
+def _current_triplet(conn: sqlite3.Connection, dock_day: str) -> dict[tuple[str, str], tuple[float, float, float]]:
+    expect_m = _sum_map(conn, "expect_lines", dock_day)
+    receive_m = _sum_map(conn, "receive_lines", dock_day)
+    confirm_m = _sum_map(conn, "confirm_lines", dock_day)
+    keys = set(expect_m) | set(receive_m) | set(confirm_m)
+    return {
+        k: (expect_m.get(k, 0.0), receive_m.get(k, 0.0), confirm_m.get(k, 0.0))
+        for k in keys
+    }
+
+
+def check_seal_evidence(conn: sqlite3.Connection, dock_day: str) -> sqlite3.Row:
+    """结案证据校验：返回可封印的 open 批次；不满足则抛 ValueError。
+
+    证据链：存在 open 对账批次 → 差额全部处置 → 批次快照与当前三腿数据一致
+    （对账后又改写过三腿则证据过期，必须重跑对账刷新快照）。
+    本函数不写库、不提交，供单日结案与多日结案工单共用。
+    """
+    if is_sealed(conn, dock_day):
+        raise ValueError(f"到货日 {dock_day} 已结案")
+    batch = conn.execute(
+        "SELECT * FROM reconcile_batches WHERE dock_day=? AND status='open' ORDER BY id DESC LIMIT 1",
+        (dock_day,),
+    ).fetchone()
+    if not batch:
+        raise ValueError(f"到货日 {dock_day} 缺少对账证据：请先跑三联对账")
+    pending = conn.execute(
+        "SELECT COUNT(*) c FROM variance_rows WHERE batch_id=? AND fate='pending'",
+        (batch["id"],),
+    ).fetchone()["c"]
+    if pending:
+        raise ValueError(f"到货日 {dock_day} 仍有 {pending} 条差额未处置，不能结案")
+    if _snapshot_map(conn, batch["id"]) != _current_triplet(conn, dock_day):
+        raise ValueError(f"到货日 {dock_day} 的对账证据已过期：三腿数据在对账后被改写，请重跑三联对账")
+    return batch
 
 
 def run_reconcile(conn: sqlite3.Connection, dock_day: str) -> dict:
@@ -75,6 +126,10 @@ def run_reconcile(conn: sqlite3.Connection, dock_day: str) -> dict:
         "UPDATE reconcile_batches SET matched_count=?, variance_count=? WHERE id=?",
         (matched, variance, batch_id),
     )
+    emit_audit(
+        conn, "reconcile_run", dock_day=dock_day,
+        detail=f"批次 {batch_no} 物化：对齐 {matched}，差额 {variance}",
+    )
     conn.commit()
     return {
         "batch_id": batch_id,
@@ -87,23 +142,13 @@ def run_reconcile(conn: sqlite3.Connection, dock_day: str) -> dict:
 
 
 def seal_day(conn: sqlite3.Connection, dock_day: str) -> dict:
-    batch = conn.execute(
-        "SELECT * FROM reconcile_batches WHERE dock_day=? AND status='open' ORDER BY id DESC LIMIT 1",
-        (dock_day,),
-    ).fetchone()
-    if not batch:
-        raise ValueError("没有可结案的对账批次，请先跑三联对账")
-    pending = conn.execute(
-        "SELECT COUNT(*) c FROM variance_rows WHERE batch_id=? AND fate='pending'",
-        (batch["id"],),
-    ).fetchone()["c"]
-    if pending:
-        raise ValueError(f"仍有 {pending} 条差额未处置，不能结案")
+    batch = check_seal_evidence(conn, dock_day)
     now = _now()
     conn.execute(
         "UPDATE reconcile_batches SET status='sealed', sealed_at=? WHERE id=?",
         (now, batch["id"]),
     )
+    emit_audit(conn, "day_sealed", dock_day=dock_day, detail=f"单日结案，批次 {batch['batch_no']} 封印")
     conn.commit()
     return dict(conn.execute("SELECT * FROM reconcile_batches WHERE id=?", (batch["id"],)).fetchone())
 
@@ -119,5 +164,9 @@ def set_variance_fate(conn: sqlite3.Connection, variance_id: int, fate: str) -> 
     if batch and batch["status"] == "sealed":
         raise ValueError("已结案批次不可改差额命运")
     conn.execute("UPDATE variance_rows SET fate=? WHERE id=?", (fate, variance_id))
+    emit_audit(
+        conn, "variance_fate", dock_day=row["dock_day"],
+        detail=f"差额#{variance_id} {row['supplier_code']}/{row['sku']} 命运置为 {fate}",
+    )
     conn.commit()
     return dict(conn.execute("SELECT * FROM variance_rows WHERE id=?", (variance_id,)).fetchone())

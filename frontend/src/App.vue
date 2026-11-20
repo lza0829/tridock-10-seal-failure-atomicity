@@ -11,6 +11,8 @@
         <router-link to="/receives">03 实收</router-link>
         <router-link to="/confirms">04 回执</router-link>
         <router-link to="/reconcile">05 三联对账</router-link>
+        <router-link to="/close-orders">06 结案工单</router-link>
+        <router-link to="/failures">07 失败清单</router-link>
         <router-link to="/settings">设置</router-link>
       </nav>
     </aside>

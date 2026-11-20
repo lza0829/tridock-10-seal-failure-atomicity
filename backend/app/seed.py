@@ -85,6 +85,61 @@ CREATE TABLE IF NOT EXISTS reopen_requests (
   dock_day TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'none'
 );
+-- 结案工单：一次勾选多日提交，整单原子（任一日失败则整单回滚）。
+CREATE TABLE IF NOT EXISTS close_orders (
+  id INTEGER PRIMARY KEY,
+  order_no TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL,               -- committed | failed
+  day_count INTEGER NOT NULL,
+  sealed_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  finished_at TEXT,
+  note TEXT
+);
+-- 工单 attempt：每次提交/重试产生一条，工单状态以最新 attempt 为准。
+CREATE TABLE IF NOT EXISTS close_order_attempts (
+  id INTEGER PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES close_orders(id),
+  attempt_no INTEGER NOT NULL,
+  status TEXT NOT NULL,               -- committed | failed
+  error TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  UNIQUE(order_id, attempt_no)
+);
+-- 逐日结果：sealed=本日已封印；rejected=本日未过校验；rolled_back=本日无辜被整单回滚。
+CREATE TABLE IF NOT EXISTS close_order_days (
+  id INTEGER PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES close_orders(id),
+  attempt_id INTEGER NOT NULL REFERENCES close_order_attempts(id),
+  dock_day TEXT NOT NULL,
+  batch_id INTEGER,
+  status TEXT NOT NULL,
+  reason TEXT,
+  UNIQUE(attempt_id, dock_day)
+);
+-- 逐日租约：held 状态每日最多一条（部分唯一索引），防止并发工单双封同日；
+-- 封印成功后租约转为 converted 留痕；整单回滚时随事务消失，不留残留锁。
+CREATE TABLE IF NOT EXISTS day_leases (
+  id INTEGER PRIMARY KEY,
+  dock_day TEXT NOT NULL,
+  order_id INTEGER NOT NULL,
+  attempt_id INTEGER NOT NULL,
+  state TEXT NOT NULL,                -- held | converted
+  acquired_at TEXT NOT NULL,
+  released_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS day_leases_held ON day_leases(dock_day) WHERE state='held';
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  dock_day TEXT,
+  order_id INTEGER,
+  attempt_id INTEGER,
+  detail TEXT
+);
 '''
 
 
